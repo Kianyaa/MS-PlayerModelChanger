@@ -1,11 +1,20 @@
 # MS-PlayerModelChanger
 
-add path of model in `model-list.json.json`
+## Commands
+- !model `<index>` - change player model following index
+- !modellist - print all available player model list in chat
+
+## Requirements
+- [ModSharp](https://github.com/Kxnrl/modsharp-public)
+
+## How to install 
+Download latest version of module at [Releases Latest](https://github.com/Kianyaa/MS-PlayerModelChanger/releases/tag/Latest) and extract zip file and drop it in `game\sharp\modules` directory <br>
+and add path of model in `model-list.json.json` follow JSON stucture below example
 
 > [!NOTE]  
-> `model-list.json.json` file will automatically create at `modules` directory
+> `model-list.json.json` file will automatically create at `modules` directory after run plugin for first time
 
-### Example Input of Lump text file `model-list.json.json`
+### Example JSON file `model-list.json.json`
 ```json
 {
   "paths": [
