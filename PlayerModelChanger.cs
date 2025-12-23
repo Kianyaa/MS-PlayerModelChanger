@@ -9,10 +9,8 @@ using Sharp.Shared.Listeners;
 using Sharp.Shared.Managers;
 using Sharp.Shared.Objects;
 using Sharp.Shared.Types;
-using System;
-using System.IO;
-using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
+using System.IO;
 
 namespace MS_PlayerModelChanger
 {
@@ -39,6 +37,7 @@ namespace MS_PlayerModelChanger
             _logger = sharedSystem.GetLoggerFactory().CreateLogger<PlayerModelChanger>();
         }
 
+        private IDisposable? _callback;
         private readonly string _dllPath;
         private readonly IModSharp _modSharp;
         private readonly ISharpModuleManager _modules;
@@ -90,9 +89,21 @@ namespace MS_PlayerModelChanger
                 return;
             }
 
-            var moduleJsonPath = Path.Combine(moduleDir, "model-list.json");
+            // Place model-list.json inside the 'PlayerModelChanger' subfolder under the module directory.
+            var moduleJsonPath = Path.Combine(moduleDir, "PlayerModelChanger", "model-list.json");
+            var moduleJsonDir = Path.GetDirectoryName(moduleJsonPath) ?? moduleDir;
 
-            // If file does not exist, create a default template in the module directory only.
+            // Ensure the target folder exists (safe to call even if it already exists).
+            try
+            {
+                Directory.CreateDirectory(moduleJsonDir);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to create module folder {Folder}. Continuing; file operations may fail.", moduleJsonDir);
+            }
+
+            // If file does not exist, create a default template in the PlayerModelChanger folder.
             if (!File.Exists(moduleJsonPath))
             {
                 var templateObj = new
@@ -114,7 +125,7 @@ namespace MS_PlayerModelChanger
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to create model-list.json in module directory {Path}. Will not attempt creation in other directories.", moduleJsonPath);
+                    _logger.LogError(ex, "Failed to create model-list.json in {Path}. Will not attempt creation in other directories.", moduleJsonPath);
                     return;
                 }
             }
@@ -122,7 +133,7 @@ namespace MS_PlayerModelChanger
             // At this point moduleJsonPath should exist (either previously or newly created).
             if (!File.Exists(moduleJsonPath))
             {
-                _logger.LogWarning("model-list.json not found in module directory after attempted creation.");
+                _logger.LogWarning("model-list.json not found in PlayerModelChanger folder after attempted creation.");
                 return;
             }
 
@@ -195,22 +206,85 @@ namespace MS_PlayerModelChanger
 
         public void OnAllModulesLoaded(string name)
         {
-
+            // Attempt to cache ClientPreferences interface after other modules are loaded.
+            try
+            {
+                _clientpref = _modules.GetOptionalSharpModuleInterface<IClientPreference>(IClientPreference.Identity);
+                if (_clientpref?.Instance is { } inst)
+                {
+                    _callback = inst.ListenOnLoad(OnCookieLoad);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error while obtaining ClientPreferences interface in OnAllModulesLoaded.");
+            }
         }
 
         void OnLibraryConnected(string name)
         {
             _logger.LogInformation($"Module {name} is loaded.");
+
+            // If ClientPreferences just connected, cache the required interface and listen for cookie loads.
+            if (string.Equals(name, "ClientPreferences", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    _clientpref = _modules.GetRequiredSharpModuleInterface<IClientPreference>(IClientPreference.Identity);
+                    if (_clientpref?.Instance is { } inst)
+                    {
+                        _callback = inst.ListenOnLoad(OnCookieLoad);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to get required ClientPreferences interface when library connected.");
+                }
+            }
         }
 
         public void OnLibraryDisconnect(string name)
         {
-
+            // Clear cached interface when ClientPreferences unloads
+            if (string.Equals(name, "ClientPreferences", StringComparison.OrdinalIgnoreCase))
+            {
+                _callback?.Dispose();
+                _callback = null;
+                _clientpref = null;
+            }
         }
 
         private void OnCookieLoad(IGameClient client)
         {
+            // When ClientPreferences notifies a cookie load, read "PlayerDefaultModel" and apply to our slot cache.
+            if (client == null)
+                return;
 
+            var cp = _clientpref?.Instance;
+            if (cp == null)
+                return;
+
+            if (!cp.IsLoaded(client.SteamId))
+                return;
+
+            var cookie = cp.GetCookie(client.SteamId, "PlayerDefaultModel");
+            if (cookie == null)
+                return;
+
+            var modelPath = cookie.GetString();
+            if (string.IsNullOrWhiteSpace(modelPath))
+                return;
+
+            var player = client.GetPlayerController();
+            if (player == null || !player.IsValid())
+                return;
+
+            var slot = player.PlayerSlot;
+            if (slot < 0 || slot >= playerModelBySlot.Length)
+                return;
+
+            playerModelBySlot[slot] = modelPath;
+            _logger.LogInformation("[ModelChanger] : Loaded PlayerDefaultModel cookie for {Player} (slot {Slot}) => {Model}", player.PlayerName, slot, modelPath);
         }
 
         public void Shutdown()
@@ -222,6 +296,7 @@ namespace MS_PlayerModelChanger
 
             _eventManager.RemoveEventListener(this);
             _modSharp.RemoveGameListener(this);
+            _callback?.Dispose();
         }
 
         public void FireGameEvent(IGameEvent e)
@@ -251,6 +326,29 @@ namespace MS_PlayerModelChanger
                 {
                     // initialize to null (explicitly), modelPath starts as null per your requirement
                     playerModelBySlot[slot] = null;
+
+                    // If ClientPreferences is available and has a saved model cookie, load it into our slot cache.
+                    try
+                    {
+                        var cp = _clientpref?.Instance;
+                        if (cp != null && cp.IsLoaded(client.SteamId))
+                        {
+                            var cookie = cp.GetCookie(client.SteamId, "PlayerDefaultModel");
+                            if (cookie != null)
+                            {
+                                var modelPath = cookie.GetString();
+                                if (!string.IsNullOrWhiteSpace(modelPath))
+                                {
+                                    playerModelBySlot[slot] = modelPath;
+                                    _logger.LogInformation("[ModelChanger] : Applied saved cookie model for {Player} (slot {Slot}) => {Model}", player.PlayerName, slot, modelPath);
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error while reading ClientPreferences cookie for player {Player}", player.PlayerName);
+                    }
                 }
             }
         }
@@ -290,7 +388,7 @@ namespace MS_PlayerModelChanger
                     $"{ChatColor.White}[{ChatColor.Green}PlayerModelChanger{ChatColor.White}] {ChatColor.White}Applied model: {shortName}",
                     recipient);
 
-                _logger.LogInformation("[ModelChanger] : Player {Player} (slot {Slot}) applied stored model {Model}", playerName, slot, shortName);
+                //_logger.LogInformation("[ModelChanger] : Player {Player} (slot {Slot}) applied stored model {Model}", playerName, slot, shortName);
             }
             catch (Exception ex)
             {
@@ -353,6 +451,29 @@ namespace MS_PlayerModelChanger
                         playerModelBySlot[slot] = modelPath;
                 }
 
+                // Persist choice to ClientPreferences cookie if interface available
+                try
+                {
+                    var cp = _clientpref?.Instance;
+                    if (cp != null)
+                    {
+                        // ensure the module has loaded this client's cookies
+                        if (!cp.IsLoaded(client.SteamId))
+                        {
+                            // If not loaded we still set the cookie; when loaded ListenOnLoad will notify
+                            cp.SetCookie(client.SteamId, "PlayerDefaultModel", modelPath);
+                        }
+                        else
+                        {
+                            cp.SetCookie(client.SteamId, "PlayerDefaultModel", modelPath);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to save ClientPreferences cookie for client {SteamId}", client.SteamId);
+                }
+
                 // extract the last path segment and remove extension (works with '/' or '\')
                 var shortName = Path.GetFileNameWithoutExtension(modelPath);
 
@@ -391,5 +512,7 @@ namespace MS_PlayerModelChanger
             }
             return ECommandAction.Stopped;
         }
+
+
     }
 }
