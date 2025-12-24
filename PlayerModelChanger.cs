@@ -47,7 +47,6 @@ namespace MS_PlayerModelChanger
         private readonly ILogger<PlayerModelChanger> _logger;
         private readonly bool _hotReload;
 
-
         private IModSharpModuleInterface<IClientPreference>? _clientpref;
 
         private readonly string[] precache_models_path = new string[65];
@@ -72,6 +71,13 @@ namespace MS_PlayerModelChanger
         {
             RegisterEvents();
             LoadPrecacheModels();
+            // Try to cache ClientPreferences early in PostInit so command use later is more likely to succeed.
+            EnsureClientPrefCached(nameof(PostInit));
+
+
+            //_logger.LogInformation("[ModelChanger] _dllPath: {DllPath}", _dllPath);
+
+
         }
 
         private void RegisterEvents()
@@ -186,61 +192,103 @@ namespace MS_PlayerModelChanger
 
         public void OnResourcePrecache()
         {
-            // Precache any models loaded from model-list.json
-            foreach (var path in precache_models_path)
+            try
             {
-                if (!string.IsNullOrWhiteSpace(path))
+                var gamePath = _modSharp.GetGamePath() ?? string.Empty;
+                //_logger.LogInformation("[ModelChanger] GamePath: {GamePath}", gamePath);
+
+                foreach (var model in precache_models_path)
                 {
+                    if (string.IsNullOrWhiteSpace(model))
+                        continue;
+
                     try
                     {
-                        _modSharp.PrecacheResource(path);
-                        _logger.LogInformation($"[ModelChanger] : PrecacheResource ({path})");
+                        // Normalize separators and trim any leading separators so Path.Combine works as expected.
+                        var normalizedModel = model.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar).TrimStart(Path.DirectorySeparatorChar);
+
+                        // Build the file system path under the game directory.
+                        var fsPath = Path.Combine(gamePath, normalizedModel);
+
+                        // If the model is a .vmdl in the list, the compiled file on disk is usually .vmdl_c.
+                        // Convert for existence check: "model.vmdl" -> "model.vmdl_c".
+                        string checkPath;
+                        const string vmdlExt = ".vmdl";
+                        if (fsPath.EndsWith(vmdlExt, StringComparison.OrdinalIgnoreCase))
+                        {
+                            checkPath = fsPath.Substring(0, fsPath.Length - vmdlExt.Length) + ".vmdl_c";
+                        }
+                        else
+                        {
+                            // If it's not a .vmdl listed, still use the raw path for existence check.
+                            checkPath = fsPath;
+                        }
+
+                        // Check for file existence on disk before attempting to precache.
+                        if (!File.Exists(checkPath))
+                        {
+                            _logger.LogWarning("[ModelChanger] Compiled model file not found; skipping precache. Checked: ({CheckedPath})", checkPath);
+                            continue;
+                        }
+
+                        // Precache the resource using the original resource path (as in model-list.json).
+                        _modSharp.PrecacheResource(model);
+                        _logger.LogInformation("[ModelChanger] PrecacheResource({Model}) Status: {Status}", model, _modSharp.GetResourceStatus(model));
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(ex, "Failed to precache resource {Path}", path);
+                        _logger.LogWarning(ex, "[ModelChanger] Failed processing model entry '{ModelEntry}'", model);
                     }
                 }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[ModelChanger] Unexpected error in OnResourcePrecache");
             }
         }
 
         public void OnAllModulesLoaded(string name)
         {
             // Attempt to cache ClientPreferences interface after other modules are loaded.
-            try
-            {
-                _clientpref = _modules.GetOptionalSharpModuleInterface<IClientPreference>(IClientPreference.Identity);
-                if (_clientpref?.Instance is { } inst)
-                {
-                    _callback = inst.ListenOnLoad(OnCookieLoad);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Error while obtaining ClientPreferences interface in OnAllModulesLoaded.");
-            }
+            //try
+            //{
+            //    _clientpref = _modules.GetOptionalSharpModuleInterface<IClientPreference>(IClientPreference.Identity);
+            //    if (_clientpref?.Instance is { } inst)
+            //    {
+            //        _callback = inst.ListenOnLoad(OnCookieLoad);
+            //    }
+            //}
+            //catch (Exception ex)
+            //{
+            //    _logger.LogWarning(ex, "Error while obtaining ClientPreferences interface in OnAllModulesLoaded.");
+            //}
         }
 
-        void OnLibraryConnected(string name)
+        public void OnLibraryConnected(string name)
         {
-            _logger.LogInformation($"Module {name} is loaded.");
+            
+            //// Ensure we try to cache as soon as a library connects (helps with race where command runs early).
+            ////EnsureClientPrefCached(nameof(OnLibraryConnected));
 
-            // If ClientPreferences just connected, cache the required interface and listen for cookie loads.
-            if (string.Equals(name, "ClientPreferences", StringComparison.OrdinalIgnoreCase))
-            {
-                try
-                {
-                    _clientpref = _modules.GetRequiredSharpModuleInterface<IClientPreference>(IClientPreference.Identity);
-                    if (_clientpref?.Instance is { } inst)
-                    {
-                        _callback = inst.ListenOnLoad(OnCookieLoad);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to get required ClientPreferences interface when library connected.");
-                }
-            }
+            //_logger.LogInformation($"Module {name} is loaded.");
+
+            //// If ClientPreferences just connected, cache the required interface and listen for cookie loads.
+            //if (string.Equals(name, "ClientPreferences", StringComparison.OrdinalIgnoreCase))
+            //{
+            //    try
+            //    {
+            //        _clientpref = _modules.GetRequiredSharpModuleInterface<IClientPreference>(IClientPreference.Identity);
+            //        if (_clientpref?.Instance is { } inst)
+            //        {
+            //            _callback = inst.ListenOnLoad(OnCookieLoad);
+            //            _logger.LogInformation("[ModelChanger] Cached required ClientPreferences interface in OnLibraryConnected");
+            //        }
+            //    }
+            //    catch (Exception ex)
+            //    {
+            //        _logger.LogWarning(ex, "Failed to get required ClientPreferences interface when library connected.");
+            //    }
+            //}
         }
 
         public void OnLibraryDisconnect(string name)
@@ -256,35 +304,58 @@ namespace MS_PlayerModelChanger
 
         private void OnCookieLoad(IGameClient client)
         {
-            // When ClientPreferences notifies a cookie load, read "PlayerDefaultModel" and apply to our slot cache.
-            if (client == null)
-                return;
+            // Diagnostic: log when ListenOnLoad notifies us
+            try
+            {
+                if (client == null)
+                {
+                    _logger.LogInformation("[ModelChanger] OnCookieLoad called with null client");
+                    return;
+                }
 
-            var cp = _clientpref?.Instance;
-            if (cp == null)
-                return;
+                _logger.LogInformation("[ModelChanger] OnCookieLoad fired for SteamId {SteamId}", client.SteamId);
 
-            if (!cp.IsLoaded(client.SteamId))
-                return;
+                var cp = _clientpref?.Instance;
+                if (cp == null)
+                {
+                    _logger.LogWarning("[ModelChanger] OnCookieLoad: ClientPreferences interface not available for SteamId {SteamId}", client.SteamId);
+                    return;
+                }
 
-            var cookie = cp.GetCookie(client.SteamId, "PlayerDefaultModel");
-            if (cookie == null)
-                return;
+                if (!cp.IsLoaded(client.SteamId))
+                {
+                    _logger.LogInformation("[ModelChanger] OnCookieLoad: ClientPreferences reports not loaded for SteamId {SteamId}", client.SteamId);
+                    return;
+                }
 
-            var modelPath = cookie.GetString();
-            if (string.IsNullOrWhiteSpace(modelPath))
-                return;
+                var cookie = cp.GetCookie(client.SteamId, "PlayerDefaultModel");
+                if (cookie == null)
+                {
+                    _logger.LogInformation("[ModelChanger] OnCookieLoad: No PlayerDefaultModel cookie for SteamId {SteamId}", client.SteamId);
+                    return;
+                }
 
-            var player = client.GetPlayerController();
-            if (player == null || !player.IsValid())
-                return;
+                var modelPath = cookie.GetString();
+                _logger.LogInformation("[ModelChanger] OnCookieLoad: PlayerDefaultModel for {SteamId} => {Model}", client.SteamId, modelPath);
 
-            var slot = player.PlayerSlot;
-            if (slot < 0 || slot >= playerModelBySlot.Length)
-                return;
+                if (string.IsNullOrWhiteSpace(modelPath))
+                    return;
 
-            playerModelBySlot[slot] = modelPath;
-            _logger.LogInformation("[ModelChanger] : Loaded PlayerDefaultModel cookie for {Player} (slot {Slot}) => {Model}", player.PlayerName, slot, modelPath);
+                var player = client.GetPlayerController();
+                if (player == null || !player.IsValid())
+                    return;
+
+                var slot = player.PlayerSlot;
+                if (slot < 0 || slot >= playerModelBySlot.Length)
+                    return;
+
+                playerModelBySlot[slot] = modelPath;
+                _logger.LogInformation("[ModelChanger] : Loaded PlayerDefaultModel cookie for {Player} (slot {Slot}) => {Model}", player.PlayerName, slot, modelPath);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ModelChanger] Exception in OnCookieLoad");
+            }
         }
 
         public void Shutdown()
@@ -455,18 +526,17 @@ namespace MS_PlayerModelChanger
                 try
                 {
                     var cp = _clientpref?.Instance;
-                    if (cp != null)
+                    if (cp == null)
                     {
-                        // ensure the module has loaded this client's cookies
-                        if (!cp.IsLoaded(client.SteamId))
-                        {
-                            // If not loaded we still set the cookie; when loaded ListenOnLoad will notify
-                            cp.SetCookie(client.SteamId, "PlayerDefaultModel", modelPath);
-                        }
-                        else
-                        {
-                            cp.SetCookie(client.SteamId, "PlayerDefaultModel", modelPath);
-                        }
+                        _logger.LogWarning("[ModelChanger] ClientPreferences interface not available when saving cookie for {SteamId}", client.SteamId);
+                    }
+                    else
+                    {
+                        var loaded = cp.IsLoaded(client.SteamId);
+                        //_logger.LogInformation("[ModelChanger] ClientPreferences.IsLoaded({SteamId}) == {Loaded}", client.SteamId, loaded);
+
+                        cp.SetCookie(client.SteamId, "PlayerDefaultModel", modelPath);
+                        _logger.LogInformation("[ModelChanger] SetCookie called for {SteamId} => {Model}", client.SteamId, modelPath);
                     }
                 }
                 catch (Exception ex)
@@ -513,6 +583,28 @@ namespace MS_PlayerModelChanger
             return ECommandAction.Stopped;
         }
 
+        private void EnsureClientPrefCached(string caller)
+        {
+            try
+            {
+                if (_clientpref?.Instance != null)
+                    return;
 
+                _clientpref = _modules.GetOptionalSharpModuleInterface<IClientPreference>(IClientPreference.Identity);
+                if (_clientpref?.Instance is { } inst)
+                {
+                    _callback = inst.ListenOnLoad(OnCookieLoad);
+                    _logger.LogInformation("[ModelChanger] Cached ClientPreferences interface (called from {Caller})", caller);
+                }
+                else
+                {
+                    _logger.LogInformation("[ModelChanger] ClientPreferences interface not available (called from {Caller})", caller);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ModelChanger] Error obtaining ClientPreferences interface (called from {Caller})", caller);
+            }
+        }
     }
 }
